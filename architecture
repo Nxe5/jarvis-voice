@@ -1,0 +1,467 @@
+# Jarvis Desktop Assistant — Architecture & Build Plan
+
+**One Tauri app. Built and tested on macOS. Shipped and running on Windows. Fully local voice pipeline. Animated reactive orb front end.**
+
+---
+
+## 1. What we're building
+
+- A single Tauri 2 application (one codebase, one repo) that compiles natively for both macOS and Windows.
+- A Rust-native, always-listening voice pipeline running *inside* the app (no separate server, no Python, no Docker): wake word → voice activity detection → local speech-to-text.
+- A "Jarvis" front end: a glowing orb that idles, perks up on wake word, animates while listening, and reacts distinctly when it accepts/processes a command.
+- A command dispatcher that takes the transcribed text and forwards it to your agent backend (referred to here as **"open claw"** — see [Section 10](#10-open-decisions) for what I need from you to finish this part).
+
+Everything voice-related runs locally on the user's machine. No audio ever needs to leave the device unless you deliberately choose a cloud STT later.
+
+---
+
+## 2. Architecture at a glance
+
+Tauri's whole value proposition is: **native Rust core + web-tech front end, one process, one binary.** We lean into that fully — no sidecar, no subprocess for the voice pipeline. The voice engine runs as an async background task inside the same Rust core that powers the window.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       ONE Tauri Application                       │
+│                                                                    │
+│  ┌────────────────────────────┐      ┌───────────────────────┐   │
+│  │  Rust Core  (src-tauri)     │      │  Webview (React + TS)  │   │
+│  │                             │      │                        │   │
+│  │  ┌───────────────────────┐  │      │  ┌──────────────────┐  │   │
+│  │  │  Voice Engine          │  │      │  │  Jarvis Orb       │  │   │
+│  │  │  (tokio background     │  │Tauri │  │  (WebGL/Canvas,   │  │   │
+│  │  │   task, runs from      │◄─┼──────┼─►│   audio-reactive) │  │   │
+│  │  │   app startup)         │  │events│  │                   │  │   │
+│  │  │                        │  │  &   │  │  Transcript panel │  │   │
+│  │  │  mic (cpal)            │  │cmds  │  │  Settings panel   │  │   │
+│  │  │   → VAD (silero)       │  │      │  └──────────────────┘  │   │
+│  │  │   → wake word (oww)    │  │      │                        │   │
+│  │  │   → STT (whisper.cpp)  │  │      │                        │   │
+│  │  └───────────┬────────────┘  │      │                        │   │
+│  │              │ text            │      │                        │   │
+│  │  ┌───────────▼────────────┐  │      │                        │   │
+│  │  │  Command Dispatcher     │  │      │                        │   │
+│  │  │  (pluggable backend)    │  │      │                        │   │
+│  │  └───────────┬────────────┘  │      └───────────────────────┘   │
+│  └──────────────┼───────────────┘                                  │
+└─────────────────┼──────────────────────────────────────────────────┘
+                   │ subprocess / HTTP / SDK call
+                   ▼
+          Your agent backend ("open claw")
+```
+
+Why this shape, specifically:
+
+- **No sidecar process for voice.** Earlier I'd suggested a separate sidecar; now that it's confirmed to be one Tauri app, the voice engine is just a `tokio::spawn`'d task inside the Rust core, managed by Tauri's app state. Simpler build, simpler packaging, one process to debug.
+- **Rust owns all the ML inference**, via bindings to well-established C/C++ libraries (whisper.cpp) and ONNX Runtime — not Python. This is what makes "build on Mac, run on Windows" tractable: it's all compiled native code with cross-platform crates, not a Python environment you'd have to replicate.
+- **The webview only renders.** It never touches the microphone directly. The Rust core streams audio amplitude/frequency data and state transitions to the front end via Tauri's event system, and the orb animates off that.
+
+---
+
+## 3. Tech stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| App shell | **Tauri 2** (current stable: v2.10.x) | Small binaries, native performance, one codebase for macOS + Windows, actively maintained, production-proven (Tauri 2.0 went stable Oct 2024, now widely used) |
+| Frontend | **React + TypeScript + Vite** | Standard, fast dev loop, huge animation ecosystem |
+| Package manager | **pnpm** | As requested — fast installs, efficient disk usage, good workspace support |
+| Orb rendering | **react-three-fiber** (WebGL/Three.js) for the polished version; plain **Canvas2D** for the MVP | A shader-driven sphere gets you real "liquid glow" motion and amplitude-reactive distortion; Canvas2D is enough to get something on screen in day one |
+| State (frontend) | **Zustand** | Minimal boilerplate, easy to update from Tauri event listeners |
+| Audio capture | **cpal** (Rust) | True cross-platform audio I/O — CoreAudio backend on macOS, WASAPI on Windows — actively maintained, no Python dependency |
+| Voice activity detection | **silero-vad-rs** (or equivalent, via the `ort` ONNX Runtime crate) | Filters silence before it ever reaches wake-word/STT, cuts CPU use dramatically for an always-on mic |
+| Wake word | **oww-rs** (a Rust port of openWakeWord, via `ort`) | Ships a pre-trained `hey_jarvis` ONNX model out of the box — genuinely on-brand for this project, and you can train/swap in a custom wake word later via the original openWakeWord toolchain |
+| Speech-to-text | **whisper-rs** (Rust bindings to whisper.cpp) | Fully local/offline, cross-platform (Windows MSVC, macOS Intel + Apple Silicon w/ Metal, Linux), GGML model files are portable binary blobs — the exact thing that lets you prep a model on Mac and ship the same file to Windows |
+| ONNX inference runtime | **ort** (pykeio/ort, currently ~2.0 RC, wrapping ONNX Runtime) | Backs both VAD and wake word, cross-platform, GPU-optional |
+| Dispatcher | Rust trait + pluggable implementation | Keeps "open claw" swappable — subprocess, HTTP, or SDK, decided later without touching the voice pipeline |
+| CI / cross-platform builds | **GitHub Actions matrix** (`macos-latest` + `windows-latest`) with `tauri-action` | Real native builds on each OS — see [Section 8](#8-cross-platform-builds--testing-with-pnpm) for why this beats trying to cross-compile from a single Mac |
+
+A note on why not Python anywhere in this stack: every model here (Whisper via whisper.cpp, Silero VAD, openWakeWord) has a mature, actively-maintained Rust binding that talks directly to compiled C/C++ or ONNX Runtime. That means your only toolchain to manage is Rust + Node, on both platforms — no bundling a Python interpreter and site-packages into a desktop installer, which is its own can of worms.
+
+---
+
+## 4. Project structure
+
+Keep it as a single pnpm-managed Tauri project — no need for a multi-package monorepo unless you plan to split shared types out later.
+
+```
+jarvis-app/
+├── package.json                 # pnpm scripts: dev, build, tauri
+├── pnpm-lock.yaml
+├── pnpm-workspace.yaml          # optional now, useful if you split packages later
+├── src/                         # React front end
+│   ├── main.tsx
+│   ├── App.tsx
+│   ├── components/
+│   │   ├── JarvisOrb.tsx        # the orb, audio-reactive
+│   │   ├── Transcript.tsx
+│   │   └── SettingsPanel.tsx
+│   ├── state/
+│   │   └── voiceStore.ts        # Zustand store, updated from Tauri events
+│   └── lib/
+│       └── tauriEvents.ts       # typed wrappers around listen()/invoke()
+├── src-tauri/                   # Rust core
+│   ├── Cargo.toml
+│   ├── tauri.conf.json
+│   ├── icons/
+│   ├── models/                  # bundled GGML + ONNX model files (see §8)
+│   │   ├── ggml-base.en.bin
+│   │   ├── silero_vad.onnx
+│   │   └── hey_jarvis_v0.1.onnx
+│   └── src/
+│       ├── main.rs
+│       ├── voice/
+│       │   ├── mod.rs
+│       │   ├── capture.rs       # cpal mic stream
+│       │   ├── vad.rs           # silero-vad-rs wrapper
+│       │   ├── wake_word.rs     # oww-rs wrapper
+│       │   ├── stt.rs           # whisper-rs wrapper
+│       │   └── state_machine.rs # Idle/Wake/Listening/Processing/Responding
+│       ├── dispatcher/
+│       │   ├── mod.rs           # trait: CommandBackend
+│       │   ├── subprocess.rs
+│       │   └── http.rs
+│       └── commands.rs          # #[tauri::command] functions callable from JS
+└── .github/workflows/
+    └── release.yml              # macOS + Windows build matrix
+```
+
+---
+
+## 5. The always-listening voice engine
+
+### 5.1 State machine
+
+This is the backbone everything else hangs off of — both the dispatcher and the orb animation are just *reactions to this state*, so get it right first.
+
+```
+IDLE ──(wake word detected)──► WAKE_DETECTED ──► LISTENING ──(VAD: user stopped talking,
+  ▲                                                  │            or silence timeout)
+  │                                                  ▼
+  │                                            PROCESSING ──(STT done, text sent)──► DISPATCHING
+  │                                                  │                                    │
+  │                                                  │                                    ▼
+  │                                                  │                              RESPONDING
+  │                                                  │                                    │
+  └──────────────────────────────────────────────────┴────────────────────────────────────┘
+                                (back to IDLE, or ERROR on any failure)
+```
+
+- **IDLE** — mic is open, audio streams continuously through VAD and the wake-word model only. Nothing is recorded or transcribed yet. This is the cheapest state, CPU-wise.
+- **WAKE_DETECTED** — brief transitional state (a few hundred ms) so the orb can visibly "wake up" before it starts actually recording the command.
+- **LISTENING** — now actively buffering audio for Whisper. VAD is used here to know when the user has stopped speaking (trailing silence) so you don't wait for a fixed timeout on every single command.
+- **PROCESSING** — Whisper runs on the buffered audio, produces text.
+- **DISPATCHING** — text is handed to the command backend; this can take arbitrary time depending on what "open claw" does, so it's its own state (important for the orb — see §7).
+- **RESPONDING** — result comes back; orb shows an "answer" animation; optionally TTS speaks it.
+- **ERROR** — anything failed (no mic permission, STT error, dispatcher timeout); orb shows a distinct error pulse, then returns to IDLE.
+
+Emit every transition as a Tauri event (`voice-state-changed`) with a payload — the front end never needs to guess state, it just reacts.
+
+### 5.2 Audio capture (`cpal`)
+
+```toml
+# Cargo.toml
+[dependencies]
+cpal = "0.17"
+```
+
+```rust
+// voice/capture.rs (sketch)
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+pub fn start_input_stream(sender: tokio::sync::mpsc::Sender<Vec<f32>>) -> cpal::Stream {
+    let host = cpal::default_host();
+    let device = host.default_input_device().expect("no input device");
+    let config = device.default_input_config().unwrap();
+
+    let stream = device.build_input_stream(
+        &config.into(),
+        move |data: &[f32], _| {
+            let _ = sender.try_send(data.to_vec());
+        },
+        move |err| eprintln!("audio stream error: {err}"),
+        None,
+    ).unwrap();
+
+    stream.play().unwrap();
+    stream
+}
+```
+
+`cpal` uses CoreAudio on macOS and WASAPI on Windows under the hood — same Rust API, different backend at compile time, which is exactly the "write once, ship to both" property you want.
+
+### 5.3 VAD + wake word (always running, cheap)
+
+Both `silero-vad-rs` and `oww-rs` run on tiny ONNX models (a few MB each) via `ort`, CPU-only, and are cheap enough to run continuously on every audio chunk without noticeably taxing the machine. Practically:
+
+- Feed 16kHz mono frames (resample if the device's native rate differs — `cpal` gives you the native config, you'll want a small resampler, e.g. `rubato`) into VAD first.
+- Only run the wake-word model on frames VAD marks as speech — this alone cuts a large chunk of the idle CPU cost.
+- `oww-rs` ships `hey_jarvis_v0.1.onnx` as a ready-to-use example model with strong accuracy out of the box, so your literal wake phrase can be "Hey Jarvis" from day one with no custom training. If you want a different phrase later, openWakeWord's training pipeline (Python, one-time, offline) produces a new `.onnx` file you drop into `models/` — the Rust inference side doesn't change.
+
+### 5.4 Speech-to-text (`whisper-rs`)
+
+```toml
+[dependencies]
+whisper-rs = "0.16"
+```
+
+```rust
+// voice/stt.rs (sketch)
+use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+
+pub struct Transcriber {
+    ctx: WhisperContext,
+}
+
+impl Transcriber {
+    pub fn new(model_path: &str) -> Self {
+        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+            .expect("failed to load whisper model");
+        Self { ctx }
+    }
+
+    pub fn transcribe(&self, audio: &[f32]) -> String {
+        let mut state = self.ctx.create_state().expect("failed to create state");
+        let params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        state.full(params, audio).expect("transcription failed");
+
+        let num_segments = state.full_n_segments().unwrap_or(0);
+        (0..num_segments)
+            .filter_map(|i| state.full_get_segment_text(i).ok())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+```
+
+**Model size tradeoff** — pick based on the hardware you expect users to have:
+
+| Model | Approx size | Notes |
+|---|---|---|
+| `tiny` / `tiny.en` | ~75 MB | Fastest, noticeably worse accuracy on accents/noise |
+| `base` / `base.en` | ~140 MB | Good default for a command-style assistant (short utterances, limited vocabulary of intents) |
+| `small` / `small.en` | ~460 MB | Better accuracy, still real-time on most modern laptops |
+
+Start with `base.en` (assuming English commands) — it's the sweet spot for short "Jarvis, do X" style utterances. Use the `.en` variants (English-only) over the multilingual ones — smaller and slightly faster for the same accuracy if you don't need other languages.
+
+**On acceleration**: `whisper-rs` exposes `metal` and `cuda` feature flags. Enable `metal` when building on macOS for real-time performance on Apple Silicon; on Windows, either ship the CPU-only build (fine for `base`/`small` on modern CPUs) or gate a `cuda` build behind detecting an NVIDIA GPU if you want to optimize further later. Don't over-engineer this on day one — CPU inference for `base.en` is fast enough for a command assistant on both platforms.
+
+### 5.5 The critical portability point
+
+**Model files are portable; the inference binary is not.** This is worth being precise about since it's exactly what you asked for:
+
+- A GGML Whisper model (`ggml-base.en.bin`) or an ONNX model (`hey_jarvis_v0.1.onnx`, `silero_vad.onnx`) is a plain binary blob of weights. You download or prepare it once — on your Mac, it doesn't matter — and the *identical file* works on Windows. There's no "recompiling the model" step, ever.
+- What *does* need to be built separately per OS is the Rust binary that loads and runs those models (because it links against platform-specific system libraries — CoreAudio vs. WASAPI, Metal vs. CPU/CUDA paths in whisper.cpp, etc.). That's a `cargo build --release` per target OS, not a cross-compilation of the models.
+- Practical workflow: keep the model files in `src-tauri/models/` in your repo (or fetch them in a build step — see §8), and let Tauri's bundler package them into both the `.dmg`/`.app` and the `.msi`/`.exe` installers automatically. Same files, two installers.
+
+---
+
+## 6. Command dispatcher → "open claw"
+
+Design this as a trait so the actual backend integration is a small, swappable piece — you can start with a stub and wire in the real thing once it's clear what "open claw" exposes.
+
+```rust
+// dispatcher/mod.rs
+#[async_trait::async_trait]
+pub trait CommandBackend: Send + Sync {
+    async fn dispatch(&self, text: String) -> Result<String, DispatchError>;
+}
+```
+
+Three likely shapes for the real implementation, depending on what "open claw" turns out to be:
+
+1. **Subprocess** — if it's a CLI you invoke per command (e.g. something like Claude Code), implement `CommandBackend` by spawning the process with `tokio::process::Command`, writing the transcribed text to stdin (or as an argument), and capturing stdout as the response. Good if it's inherently a one-shot-per-command tool.
+2. **HTTP** — if it exposes a local or remote API, this is the cleanest option: a `reqwest`-based implementation, easy to add streaming (SSE/WebSocket) for partial responses if the backend supports long-running multi-step actions.
+3. **SDK** — if there's a native Rust or accessible library API, call it directly and skip the process/HTTP overhead entirely.
+
+Whatever it turns out to be, keep the dispatcher **async and non-blocking** relative to the voice engine — while `DISPATCHING`, the mic can keep running in the background (still in `IDLE`-equivalent passive listening) so the app doesn't feel frozen, and the orb can show a distinct "thinking" animation for however long that step takes.
+
+**This is the one piece I can't fully design without more detail from you** — see [Section 10](#10-open-decisions).
+
+---
+
+## 7. The Jarvis orb (front end)
+
+### 7.1 Rendering approach
+
+Two viable paths, pick based on how much polish you want on day one vs. later:
+
+- **MVP: Canvas2D.** A radial gradient circle with `shadowBlur` for glow, animated via `requestAnimationFrame`, amplitude driving scale/opacity. You can have something on screen and reactive within a day.
+- **Polished: WebGL via `react-three-fiber`.** A sphere with a custom fragment shader (noise-based surface distortion + fresnel glow), amplitude and frequency data driving vertex displacement uniforms in real time. This is what gives the "liquid, alive" look closer to Iron Man's Jarvis or Siri's orb, at the cost of writing (or adapting) a GLSL shader.
+
+Recommended sequencing: build the Canvas2D version first so the state machine → animation wiring is proven end-to-end, then swap the rendering internals for the shader version once the rest of the app works. The React component's *interface* (props: `state`, `amplitude`, `frequencyBands`) doesn't need to change between the two.
+
+### 7.2 State → visual mapping
+
+| Voice state | Orb behavior |
+|---|---|
+| `IDLE` | Slow ambient "breathing" — gentle scale/opacity pulse, cool color (blue/cyan), low-frequency sine wave, no audio reactivity |
+| `WAKE_DETECTED` | Sharp brightening flash, color shift, quick scale-up — this is the "it heard you" moment, keep it snappy (<300ms) |
+| `LISTENING` | Amplitude-reactive distortion/glow — orb visibly responds to the user's voice in real time, using the amplitude/frequency data streamed from Rust |
+| `PROCESSING` | Different rhythm — a steady rotating/pulsing pattern *not* tied to live audio (since nothing's being said), signaling "thinking" |
+| `DISPATCHING` | Continues the "thinking" motion, possibly slower/deeper — this can be the longest state depending on the backend, so make it read as "still working," not "stuck" |
+| `RESPONDING` | Distinct color (e.g. warm amber/green) with an outward pulse or ripple — the clear "answer accepted" moment the request asked for |
+| `ERROR` | Short red flash, then decay back to `IDLE` — must be visually distinct from all the above so users never confuse a failure with normal operation |
+
+### 7.3 Audio-reactive data flow
+
+Don't re-capture the mic in the webview — the Rust core already has it. Instead, have the voice engine compute a lightweight amplitude (RMS) and a few frequency bands (a small FFT, e.g. via the `rustfft` crate) per audio chunk, and emit them:
+
+```rust
+// inside the voice engine loop
+app_handle.emit("voice-audio-level", AudioLevel {
+    amplitude: rms,
+    bands: [low, mid, high],
+})?;
+```
+
+```ts
+// tauriEvents.ts
+import { listen } from '@tauri-apps/api/event';
+
+listen<AudioLevel>('voice-audio-level', (event) => {
+  voiceStore.getState().setAudioLevel(event.payload);
+});
+
+listen<VoiceState>('voice-state-changed', (event) => {
+  voiceStore.getState().setState(event.payload);
+});
+```
+
+Throttle this to ~30–60 updates/sec (not every raw audio callback) so you're not flooding the IPC bridge — plenty smooth for orb animation, negligible overhead.
+
+### 7.4 Component sketch
+
+```tsx
+// components/JarvisOrb.tsx
+import { useVoiceStore } from '../state/voiceStore';
+
+export function JarvisOrb() {
+  const { state, amplitude, bands } = useVoiceStore();
+  // canvas/three.js render loop reads `state` to pick animation profile,
+  // and `amplitude`/`bands` to drive reactive distortion when state === 'LISTENING'
+  return <canvas ref={canvasRef} />; // or <Canvas> from react-three-fiber
+}
+```
+
+---
+
+## 8. Cross-platform builds & testing with pnpm
+
+### 8.1 Why you can't (really) cross-compile this from a Mac
+
+This is the honest version of the constraint, because it'll save you time: `whisper-rs` and `ort` both link against native, platform-specific artifacts (whisper.cpp compiled with Metal support on macOS vs. MSVC-built ONNX Runtime DLLs on Windows). True cross-compilation of C/C++-backed Rust crates from macOS targeting Windows is possible in principle (via `xwin`/MinGW toolchains) but it's fragile, slow to debug, and not something I'd recommend building your workflow around for a project with this many native dependencies.
+
+**The realistic, low-friction path: build natively on each OS via CI**, not cross-compile from one machine.
+
+### 8.2 GitHub Actions matrix build
+
+```yaml
+# .github/workflows/release.yml
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: 'macos-latest'
+          - platform: 'windows-latest'
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'pnpm'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: 'Jarvis v__VERSION__'
+          releaseDraft: true
+```
+
+Every tagged push produces a native `.dmg`/`.app` from the macOS runner and a native `.msi`/`.exe` from the Windows runner, from the same commit, same model files bundled into both. This is your "compiled for both, for testing" pipeline — download both artifacts from the release/workflow run and test each on its native platform.
+
+### 8.3 Local development loop
+
+- **Day-to-day dev on your Mac**: `pnpm tauri dev` — full hot-reload frontend, Rust recompiles on change. This is where 90% of your iteration happens, including on the orb and the voice engine logic (mic/VAD/wake-word/STT all work fine natively on macOS).
+- **Windows-specific testing** (WASAPI quirks, MSVC build issues, installer behavior): you have three realistic options, in order of convenience:
+  1. **A cloud Windows runner via GitHub Actions**, triggered on-demand (not just on tags) — cheapest to set up, but slow iteration (push → wait for CI → download artifact).
+  2. **A Windows VM on your Mac** — Parallels Desktop (paid, best audio/USB passthrough on Apple Silicon) or UTM (free, rougher edges) — lets you run `pnpm tauro dev` equivalent loop locally on Windows, including testing actual microphone capture, at the cost of running a VM.
+  3. **An actual spare Windows machine**, if you have one — best for validating real-world audio device behavior (this is the one area, mic drivers/permissions, where VMs can behave differently from real hardware, so before final release it's worth a pass on physical Windows hardware if at all possible).
+
+Use pnpm consistently across both: `pnpm install`, `pnpm tauri build` work identically on macOS and Windows shells (PowerShell included) — pnpm itself isn't the cross-platform constraint here, the native Rust dependencies are, which is why the CI matrix (not a package-manager trick) is what actually solves it.
+
+### 8.4 Model bundling
+
+Add the model files to `tauri.conf.json`'s `bundle.resources` so they ship inside the installer rather than requiring a first-run download (simpler for testing, and works offline out of the box):
+
+```json
+{
+  "bundle": {
+    "resources": ["models/*"]
+  }
+}
+```
+
+At runtime, resolve the path via Tauri's path API (`app.path().resolve("models/ggml-base.en.bin", BaseDirectory::Resource)`) so it works whether you're running `tauri dev` or the packaged app on either OS.
+
+### 8.5 Signing (brief)
+
+Not a day-one concern, but worth knowing it's there: macOS builds should eventually be signed + notarized (Apple Developer account) or Gatekeeper will warn users on first launch; Windows builds should eventually be code-signed (a code-signing certificate) or SmartScreen will flag the installer. `tauri-action` supports both once you have the certificates — fine to skip for early internal testing.
+
+---
+
+## 9. Phased build plan
+
+A sensible order that gets you a working (if rough) end-to-end loop as early as possible, then layers polish on top:
+
+1. **Skeleton app** — `pnpm create tauri-app`, confirm it builds and runs on macOS. Static placeholder orb (just a div/circle) so the shell is proven.
+2. **Audio capture only** — wire up `cpal`, confirm you can capture and log raw mic levels from Rust, emit amplitude to the front end, make the placeholder orb pulse with it. This proves the whole Rust↔JS event bridge.
+3. **VAD** — add `silero-vad-rs`, log speech/silence segments to the console. No behavior change yet, just validate detection quality on your own voice/room.
+4. **Wake word** — add `oww-rs` with the bundled `hey_jarvis` model, wire the `IDLE → WAKE_DETECTED` transition, confirm reliability (test false-positive/false-negative rate in your actual environment).
+5. **STT** — add `whisper-rs`, wire `LISTENING → PROCESSING`, get raw transcribed text printed to console/UI. This is the first point where you have a full "say something, see it as text" loop.
+6. **Dispatcher stub** — a fake `CommandBackend` that just echoes the text back, wire the full state machine end-to-end (`IDLE → ... → RESPONDING → IDLE`).
+7. **Real orb** — replace the placeholder with the actual Canvas2D (then later WebGL) reactive design from §7.
+8. **Real dispatcher** — swap the stub for the actual "open claw" integration once that's defined.
+9. **Cross-platform CI** — set up the GitHub Actions matrix, get a Windows build produced and tested (VM or hardware).
+10. **Polish pass** — settings panel (mic device selection, model size choice, wake-word sensitivity), error states, optional TTS for responses, signing.
+
+---
+
+## 10. Open decisions
+
+A few things worth pinning down before (or while) you build, since they materially change parts of this plan:
+
+- **What exactly is "open claw"?** If you tell me whether it's a CLI you invoke, an HTTP API, or something with a Rust/JS SDK, I can write the actual `CommandBackend` implementation rather than the trait skeleton above.
+- **Does Jarvis need to talk back (TTS)?** If yes, worth deciding local (e.g. Piper, also ONNX-based and consistent with the rest of this local-first stack) vs. cloud (ElevenLabs — higher quality, adds a network dependency and per-use cost).
+- **Wake word sensitivity / always-on privacy posture** — worth deciding early whether there's any user-facing indicator that the mic is always listening (a persistent tray icon state, for instance), both for UX clarity and because "silently always-on mic" is the kind of thing users (reasonably) want visibility into.
+- **Whisper model size default** — `base.en` is my recommended starting point; revisit once you've tested real command phrases against it.
+
+---
+
+## 11. Key dependency versions (as of writing)
+
+| Crate/Package | Version | Purpose |
+|---|---|---|
+| `tauri` | 2.10.x | App shell |
+| `cpal` | 0.17.x | Audio capture |
+| `whisper-rs` | 0.16.x | STT (whisper.cpp bindings) |
+| `ort` | 2.0.0-rc.x | ONNX Runtime bindings (backs VAD + wake word) |
+| `silero-vad-rs` (or similar) | latest | Voice activity detection |
+| `oww-rs` | latest | Wake word (`hey_jarvis` model bundled) |
+| `react`, `react-dom` | 18.x | Frontend |
+| `three`, `@react-three/fiber` | latest | WebGL orb (polished version) |
+| `zustand` | latest | Frontend state |
+| `pnpm` | 9.x | Package manager |
+
+Pin exact versions in `Cargo.toml`/`package.json` when you scaffold — check each crate's current release before locking, since this is a fast-moving corner of the Rust ML ecosystem.
