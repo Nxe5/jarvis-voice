@@ -42,8 +42,10 @@ impl HttpBackend {
 impl CommandBackend for HttpBackend {
     async fn dispatch(&self, text: String) -> Result<String, DispatchError> {
         // Kimi / Moonshot (OpenAI-compatible) chat-completions request.
+        // Use a persistent user ID so sessions are maintained across commands.
         let body = json!({
             "model": self.model,
+            "user": "jarvis-voice-user",
             "messages": [
                 { "role": "system", "content": SYSTEM_PROMPT },
                 { "role": "user", "content": text }
