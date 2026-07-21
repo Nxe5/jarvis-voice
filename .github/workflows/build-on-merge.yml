@@ -50,6 +50,12 @@ jobs:
           git config user.email "narutoman@users.noreply.github.com"
           git add package.json src-tauri/Cargo.toml
           git commit -m "chore(release): bump version to ${{ steps.bump.outputs.new_version }}"
+          # Handle case where tag already exists (from previous failed run)
+          if git rev-parse "${{ steps.bump.outputs.tag_name }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.bump.outputs.tag_name }} already exists, deleting old tag"
+            git tag -d "${{ steps.bump.outputs.tag_name }}"
+            git push origin ":refs/tags/${{ steps.bump.outputs.tag_name }}" || true
+          fi
           git tag ${{ steps.bump.outputs.tag_name }}
           # Push directly to origin using full ref to avoid ambiguity
           git push origin HEAD:refs/heads/main --tags
