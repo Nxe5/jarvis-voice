@@ -46,13 +46,13 @@ jobs:
           sed -i 's/^version = "[^"]*"/version = "${{ steps.bump.outputs.new_version }}"/' src-tauri/Cargo.toml
       - name: Commit version bump
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "narutoman"
+          git config user.email "narutoman@users.noreply.github.com"
           git add package.json src-tauri/Cargo.toml
           git commit -m "chore(release): bump version to ${{ steps.bump.outputs.new_version }}"
           git tag ${{ steps.bump.outputs.tag_name }}
-          # Push directly to origin (we have write access now)
-          git push origin HEAD:main --tags
+          # Push directly to origin using full ref to avoid ambiguity
+          git push origin HEAD:refs/heads/main --tags
 
   # 1) Gate: tests must pass first
   test:
