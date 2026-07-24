@@ -105,7 +105,8 @@ console.log("  Watch: https://github.com/Nxe5/jarvis-voice/actions\n");
 if (process.platform === "darwin" && !process.env.SKIP_LOCAL_DMG) {
   console.log(`▶ Building local macOS .dmg for ${tag}…\n`);
   try {
-    run("pnpm tauri build");
+    // Don't let beforeBuildCommand bump again after we already set the tag version.
+    run("pnpm tauri build", { env: { ...process.env, SKIP_BUILD_BUMP: "1" } });
     const dmgDir = "src-tauri/target/release/bundle/dmg";
     const dmgFile = readdirSync(dmgDir).find((f) => f.endsWith(".dmg"));
     if (!dmgFile) throw new Error(`no .dmg found in ${dmgDir}`);

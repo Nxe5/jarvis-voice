@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { ComposeBox } from "./ComposeBox";
 import { useVoiceStore } from "../state/voiceStore";
 
 type Msg = { id: string; role: "user" | "jarvis" | "error"; text: string };
@@ -21,7 +22,7 @@ export function Transcript() {
     });
   });
 
-  const listening = state === "LISTENING" || state === "WAKE_DETECTED";
+  const listening = state === "LISTENING";
   const thinking = state === "PROCESSING" || state === "DISPATCHING";
 
   // Keep pinned to the newest message.
@@ -39,7 +40,7 @@ export function Transcript() {
       <div className="chat" ref={scrollRef}>
         {empty && (
           <p className="chat__empty">
-            No messages yet. Double-clap or hold <strong>Space</strong>, then speak.
+            No messages yet. Speak, or type below.
           </p>
         )}
 
@@ -76,6 +77,8 @@ export function Transcript() {
           </>
         )}
       </div>
+
+      <ComposeBox />
     </section>
   );
 }

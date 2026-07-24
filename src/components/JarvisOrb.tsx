@@ -319,13 +319,18 @@ function OrbRig() {
  * The Jarvis orb. A glowing globe of connected nodes with rings of nodes
  * orbiting it in circular patterns, all reacting to the voice-engine state and
  * live audio levels streamed from the Rust core.
+ *
+ * Pass `paused` when an overlay (settings, etc.) is open so the WebGL frame
+ * loop stops — native OS popups (e.g. `<select>`) otherwise stutter the whole
+ * WebView while the canvas keeps compositing every frame.
  */
-export function JarvisOrb() {
+export function JarvisOrb({ paused = false }: { paused?: boolean }) {
   return (
     <Canvas
       camera={{ position: [0, 0, 5.2], fov: 45 }}
       gl={{ antialias: true, alpha: true }}
       dpr={[1, 2]}
+      frameloop={paused ? "never" : "always"}
     >
       <OrbRig />
     </Canvas>

@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentSettings, AudioLevel, StateChanged } from "../types";
+import type { AgentSettings, AudioLevel, StateChanged, VoiceState } from "../types";
 import { useVoiceStore } from "../state/voiceStore";
 
 /**
@@ -12,6 +12,15 @@ import { useVoiceStore } from "../state/voiceStore";
  */
 export async function bindVoiceEvents(): Promise<UnlistenFn> {
   const store = useVoiceStore.getState();
+
+  // Sync in case the engine was already mid-state before the webview mounted
+  // (e.g. mic error flash) so the compose box isn't stuck thinking we're busy.
+  try {
+    const current = await invoke<VoiceState>("current_state");
+    store.setState(current);
+  } catch {
+    /* webview-only / early invoke — events will catch up */
+  }
 
   const unlisteners = await Promise.all([
     listen<StateChanged>("voice-state-changed", (e) => {
@@ -48,6 +57,11 @@ export function pushToTalkStop(): Promise<void> {
   return invoke("push_to_talk_stop");
 }
 
+/** Submit a typed message through the same agent dispatch path as speech. */
+export function submitText(text: string): Promise<void> {
+  return invoke("submit_text", { text });
+}
+
 /** Current agent gateway URL/key/model. */
 export function getAgentSettings(): Promise<AgentSettings> {
   return invoke("get_agent_settings");
@@ -56,4 +70,9 @@ export function getAgentSettings(): Promise<AgentSettings> {
 /** Save new agent gateway settings — applies immediately and persists to disk. */
 export function setAgentSettings(settings: AgentSettings): Promise<void> {
   return invoke("set_agent_settings", { settings });
+}
+
+/** Live OpenClaw-on-WSL gateway URL (localhost relay or eth0). */
+export function resolveOpenclawWslUrl(): Promise<string> {
+  return invoke("resolve_openclaw_wsl_url");
 }

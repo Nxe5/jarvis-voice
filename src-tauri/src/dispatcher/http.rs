@@ -29,14 +29,15 @@ pub struct HttpBackend {
 
 impl HttpBackend {
     pub fn new(endpoint: String, api_key: Option<String>, model: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             endpoint,
             api_key,
             model,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            client,
         }
     }
 }
@@ -45,10 +46,8 @@ impl HttpBackend {
 impl CommandBackend for HttpBackend {
     async fn dispatch(&self, text: String) -> Result<String, DispatchError> {
         // Kimi / Moonshot (OpenAI-compatible) chat-completions request.
-        // Use a persistent user ID so sessions are maintained across commands.
         let body = json!({
             "model": self.model,
-            "user": "jarvis-voice-user",
             "messages": [
                 { "role": "system", "content": SYSTEM_PROMPT },
                 { "role": "user", "content": text }
@@ -62,10 +61,14 @@ impl CommandBackend for HttpBackend {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| DispatchError(format!("request to {} failed: {e}", self.endpoint)))?;
+        let resp = req.send().await.map_err(|e| {
+            let hint = if self.endpoint.contains("172.") || self.endpoint.contains("192.168.") {
+                " (WSL OpenClaw unreachable — is the WSL gateway running, and is a native Windows OpenClaw stealing localhost:18789?)"
+            } else {
+                ""
+            };
+            DispatchError(format!("request to {} failed: {e}{hint}", self.endpoint))
+        })?;
         let status = resp.status();
         let raw = resp
             .text()
@@ -73,7 +76,18 @@ impl CommandBackend for HttpBackend {
             .map_err(|e| DispatchError(format!("read body failed: {e}")))?;
 
         if !status.is_success() {
-            return Err(DispatchError(format!("agent API {status}: {raw}")));
+            let msg = match status.as_u16() {
+                401 | 403 => {
+                    "I'm not authorized to reach the agent. Check the API key in Settings."
+                        .to_string()
+                }
+                404 => {
+                    "The agent endpoint wasn't found. Check Settings — OpenClaw often returns 404 when chat-completions is disabled or the gateway token is missing."
+                        .to_string()
+                }
+                _ => format!("agent API {status}: {raw}"),
+            };
+            return Err(DispatchError(msg));
         }
         extract_reply(&raw).ok_or_else(|| DispatchError(format!("unexpected response: {raw}")))
     }
@@ -164,5 +178,29 @@ mod tests {
             "Agent error: bad key"
         );
         assert!(extract_reply(r#"{"unknown":1}"#).is_none());
+    }
+
+    /// Live smoke test against the user's OpenClaw-on-WSL gateway (requires
+    /// WSL OpenClaw running with LAN bind). Run with:
+    /// `cargo test -p jarvis live_openclaw_wsl_dispatch -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_openclaw_wsl_dispatch() {
+        let settings = crate::agent_settings::AgentSettings {
+            preset: crate::agent_settings::AgentPreset::OpenClawWsl,
+            url: String::new(),
+            key: None,
+            model: crate::agent_settings::DEFAULT_AGENT_MODEL.to_string(),
+        };
+        let backend = crate::dispatcher::backend_for(&settings);
+        let out = tauri::async_runtime::block_on(backend.dispatch(
+            "Reply with exactly: jarvis-ok".into(),
+        ))
+        .expect("dispatch failed");
+        eprintln!("jarvis reply: {out}");
+        assert!(
+            out.to_lowercase().contains("jarvis-ok") || !out.trim().is_empty(),
+            "unexpected reply: {out}"
+        );
     }
 }

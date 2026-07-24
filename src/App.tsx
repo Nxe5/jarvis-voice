@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { JarvisOrb } from "./components/JarvisOrb";
-import { TranscriptModal } from "./components/TranscriptModal";
+import { Transcript } from "./components/Transcript";
 import { SettingsPanel } from "./components/SettingsPanel";
 import {
   bindVoiceEvents,
@@ -9,7 +9,7 @@ import {
   pushToTalkStart,
   pushToTalkStop,
 } from "./lib/tauriEvents";
-import { speak, stopSpeaking } from "./lib/tts";
+import { isSpeaking, speak, stopSpeaking, subscribeSpeaking } from "./lib/tts";
 import { useVoiceStore } from "./state/voiceStore";
 import type { VoiceState } from "./types";
 import "./App.css";
@@ -27,17 +27,19 @@ const LABELS: Record<VoiceState, string> = {
 function App() {
   const state = useVoiceStore((s) => s.state);
   const response = useVoiceStore((s) => s.response);
-  const historyLen = useVoiceStore((s) => s.history.length);
   const testMode = useVoiceStore((s) => s.testMode);
   const toggleTestMode = useVoiceStore((s) => s.toggleTestMode);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [transcriptOpen, setTranscriptOpen] = useState(false);
+  const speaking = useSyncExternalStore(subscribeSpeaking, isSpeaking, () => false);
 
   const handleToggleTestMode = () => {
     const next = !testMode;
     toggleTestMode();
     setTestMode(next);
   };
+
+  const statusLabel =
+    state === "DISPATCHING" && response ? response : LABELS[state];
 
   useEffect(() => {
     const unbind = bindVoiceEvents();
@@ -46,10 +48,17 @@ function App() {
     };
   }, []);
 
-  // Speak each new agent response aloud (browser TTS), if enabled.
+  // Speak agent replies / errors only — not DISPATCHING status like
+  // "OpenClaw isn't active — starting it in WSL…".
   useEffect(() => {
-    if (response && useVoiceStore.getState().speakEnabled) speak(response);
-  }, [response]);
+    if (
+      (state === "RESPONDING" || state === "ERROR") &&
+      response &&
+      useVoiceStore.getState().speakEnabled
+    ) {
+      speak(response);
+    }
+  }, [state, response]);
 
   // A new interaction interrupts any ongoing speech.
   useEffect(() => {
@@ -93,6 +102,15 @@ function App() {
   }, []);
 
   const busy = state !== "IDLE";
+  const canStop = speaking || state === "RESPONDING";
+
+  const handlePrimary = () => {
+    if (canStop) {
+      stopSpeaking();
+      return;
+    }
+    if (!busy) triggerWake();
+  };
 
   return (
     <main className="app" data-state={state}>
@@ -106,9 +124,18 @@ function App() {
             <span className="mic-live__ring" />●
           </span>
           <span className={"status__pip status__pip--" + state.toLowerCase()} />
-          {LABELS[state]}
+          {statusLabel}
         </div>
         <div className="topbar__actions">
+          <button
+            className={"icon-btn" + (speaking ? " icon-btn--on" : "")}
+            onClick={() => stopSpeaking()}
+            disabled={!speaking}
+            aria-label="Stop speaking"
+            title={speaking ? "Stop speaking" : "Nothing playing"}
+          >
+            ■
+          </button>
           <button
             className={"icon-btn" + (testMode ? " icon-btn--on" : "")}
             onClick={handleToggleTestMode}
@@ -133,32 +160,30 @@ function App() {
       </header>
 
       <div className="stage">
-        <div className="orb-wrap">
-          <JarvisOrb />
+        <div className="stage__hero">
+          <div className="orb-wrap">
+            <JarvisOrb paused={settingsOpen} />
+          </div>
+
+          <div className="controls">
+            <button
+              className={"wake-btn" + (canStop ? " wake-btn--stop" : "")}
+              onClick={handlePrimary}
+              disabled={busy && !canStop}
+            >
+              {canStop ? "Stop" : busy ? LABELS[state] + "…" : "Talk"}
+            </button>
+          </div>
+
+          <p className="clap-hint">
+            <span className="clap-hint__emoji">👏 👏</span>
+            Double-clap, hold <strong>Space</strong>, or type a message
+          </p>
         </div>
 
-        <div className="controls">
-          <button className="wake-btn" onClick={() => triggerWake()} disabled={busy}>
-            {busy ? LABELS[state] + "…" : "Talk"}
-          </button>
-          <button
-            className="transcript-btn"
-            onClick={() => setTranscriptOpen(true)}
-            aria-label="Open transcript"
-          >
-            <span className="transcript-btn__icon">❝❞</span>
-            Transcript
-            {historyLen > 0 && <span className="transcript-btn__badge">{historyLen}</span>}
-          </button>
-        </div>
-
-        <p className="clap-hint">
-          <span className="clap-hint__emoji">👏 👏</span>
-          Double-clap or hold <strong>Space</strong> to talk
-        </p>
+        <Transcript />
       </div>
 
-      {transcriptOpen && <TranscriptModal onClose={() => setTranscriptOpen(false)} />}
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
     </main>
   );

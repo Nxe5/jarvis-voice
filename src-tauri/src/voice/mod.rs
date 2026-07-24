@@ -14,5 +14,6 @@
 pub mod capture;
 pub mod state_machine;
 pub mod stt;
+pub mod tts;
 
 pub use state_machine::{VoiceEngine, VoiceState};

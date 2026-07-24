@@ -1,6 +1,6 @@
 [package]
 name = "jarvis"
-version = "0.1.12"
+version = "0.1.17"
 description = "Jarvis Desktop Assistant"
 authors = ["spacebar"]
 edition = "2021"
@@ -26,6 +26,18 @@ async-trait = "0.1"
 whisper-rs = "0.16.0"
 cpal = "0.18.1"
 reqwest = { version = "0.13.4", features = ["json"] }
+piper-rs = "0.2.0"
+hound = "3.5.1"
+base64 = "0.22"
 
 [dev-dependencies]
 hound = "3.5.1"
+
+# Native cmake deps (whisper/espeak) must not use MSVC Debug CRT in `cargo build`
+# — Debug UCRT asserts on stdio (`read.cpp: _osfile(fh) & FOPEN`) and aborts the
+# app (~exit code 3) under `tauri dev` / redirected handles.
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3
+
+[profile.dev.package.espeak-rs-sys]
+opt-level = 3

@@ -20,6 +20,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::capture;
 use super::stt::Transcriber;
+use super::tts::{self, PiperTts};
 use crate::agent_settings::AgentSettings;
 use crate::dispatcher;
 
@@ -72,11 +73,41 @@ const LISTEN_MAX: f32 = 12.0; // hard cap on a single command
 // instead of erroring). Whisper reliably hallucinates "you"/"Thank you." on
 // true silence, so catch it before transcribing rather than after.
 const MIC_SILENCE_FLOOR: f32 = 0.004;
+/// Spoken when the user triggered a turn but nothing usable was captured.
+const NO_SPEECH_REPLY: &str = "Didn't catch that.";
+
+/// Whisper often invents short phrases on silence / near-silence. Treat those
+/// as no speech so we never dispatch (and never surface agent 401 noise).
+fn is_silence_hallucination(text: &str) -> bool {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect();
+    let t = cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    matches!(
+        t.as_str(),
+        "" | "you"
+            | "thank you"
+            | "thanks"
+            | "thanks for watching"
+            | "thank you for watching"
+            | "thanks for watching bye"
+            | "subtitle"
+            | "subtitles"
+            | "music"
+    )
+}
 
 #[derive(Clone)]
 pub struct VoiceEngine {
     current: Arc<Mutex<VoiceState>>,
     transcriber: Arc<Mutex<Option<Arc<Transcriber>>>>,
+    /// Local Piper neural TTS (loaded in the background; optional).
+    tts: Arc<Mutex<Option<PiperTts>>>,
     /// Set to start a turn (Talk button, or spacebar press).
     pending_start: Arc<AtomicBool>,
     /// Set to force-end the current turn immediately (spacebar release).
@@ -98,6 +129,7 @@ impl VoiceEngine {
         Self {
             current: Arc::new(Mutex::new(VoiceState::Idle)),
             transcriber: Arc::new(Mutex::new(None)),
+            tts: Arc::new(Mutex::new(None)),
             pending_start: Arc::new(AtomicBool::new(false)),
             pending_stop: Arc::new(AtomicBool::new(false)),
             hold_mode: Arc::new(AtomicBool::new(false)),
@@ -139,6 +171,58 @@ impl VoiceEngine {
     /// End the current push-to-talk turn and send it (spacebar released).
     pub fn stop_hold(&self) {
         self.pending_stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Inject a typed message into the same dispatch / response path as a spoken
+    /// transcript. Skips mic capture and Whisper. Rejects only while an agent
+    /// turn is already in flight; typing can preempt Listening / Error so a
+    /// stuck mic or open listen window doesn't block chat.
+    pub fn submit_text(&self, app: &AppHandle, text: String) -> Result<(), String> {
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("Message is empty.".into());
+        }
+
+        {
+            let mut state = self.current.lock().unwrap();
+            match *state {
+                VoiceState::Processing | VoiceState::Dispatching | VoiceState::Responding => {
+                    return Err("Busy — wait for the current turn to finish.".into());
+                }
+                // Idle / Error / Listening / WakeDetected — take the turn.
+                _ => {}
+            }
+            *state = VoiceState::WakeDetected;
+        }
+        // Cancel any pending Talk / Space start so voice can't steal the turn.
+        self.pending_start.store(false, Ordering::SeqCst);
+        self.pending_stop.store(true, Ordering::SeqCst);
+        self.hold_mode.store(false, Ordering::SeqCst);
+        let _ = app.emit(
+            "voice-state-changed",
+            StateChanged {
+                state: VoiceState::WakeDetected,
+                detail: None,
+            },
+        );
+
+        let engine = self.clone();
+        let app = app.clone();
+        thread::spawn(move || {
+            // Clear previous turn in the UI, then dispatch without mic/Whisper.
+            thread::sleep(Duration::from_millis(80));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.handle_transcript(&app, trimmed);
+            }));
+            // Never leave the UI stuck mid-turn if something panicked.
+            if result.is_err() {
+                eprintln!("[voice] typed turn panicked — recovering to Idle");
+                engine.set(&app, VoiceState::Error, Some("Turn failed unexpectedly.".into()));
+                thread::sleep(Duration::from_millis(1200));
+                engine.set(&app, VoiceState::Idle, None);
+            }
+        });
+        Ok(())
     }
 
     fn set(&self, app: &AppHandle, state: VoiceState, detail: Option<String>) {
@@ -196,6 +280,32 @@ impl VoiceEngine {
         });
     }
 
+    /// Download (if needed) and load the local Piper neural voice in the background.
+    pub fn load_tts(&self, app: AppHandle) {
+        let slot = self.tts.clone();
+        thread::spawn(move || {
+            match tts::ensure_voice_files(&app).and_then(|(onnx, config)| {
+                PiperTts::load(&onnx, &config)
+            }) {
+                Ok(engine) => {
+                    *slot.lock().unwrap() = Some(engine);
+                    eprintln!("[tts] piper voice ready (en_US-ryan-medium)");
+                }
+                Err(e) => eprintln!("[tts] piper unavailable — browser TTS fallback: {e}"),
+            }
+        });
+    }
+
+    /// Synthesize speech with Piper. Returns base64 WAV, or an error if the
+    /// local voice isn't loaded yet / failed (caller should fall back).
+    pub fn synthesize_speech(&self, text: &str) -> Result<String, String> {
+        let mut guard = self.tts.lock().unwrap();
+        let Some(engine) = guard.as_mut() else {
+            return Err("piper voice not loaded".into());
+        };
+        engine.synthesize_wav_base64(text)
+    }
+
     /// Start the always-on mic listener: ambient levels + double-clap detection
     /// + command capture, all off one persistent stream.
     pub fn spawn_listener(&self, app: AppHandle) {
@@ -206,7 +316,15 @@ impl VoiceEngine {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("[mic] failed to open input: {e}");
-                    engine.set(&app, VoiceState::Error, Some(format!("Mic unavailable: {e}")));
+                    // Don't leave the engine stuck in Error forever — typed
+                    // chat (and later mic retries) still need Idle.
+                    engine.set(
+                        &app,
+                        VoiceState::Error,
+                        Some(format!("Mic unavailable: {e}")),
+                    );
+                    thread::sleep(Duration::from_millis(2000));
+                    engine.set(&app, VoiceState::Idle, None);
                     return;
                 }
             };
@@ -339,9 +457,18 @@ impl VoiceEngine {
                                     && silence > SILENCE_END
                                     && listen_elapsed > 1.0);
                             if done {
-                                // In push-to-talk we always process (the user
-                                // decided when to send); otherwise require speech.
-                                let heard = spoke || hold;
+                                // Typed submit may have preempted this listen turn.
+                                if engine.state() != VoiceState::Listening {
+                                    cmd_buf.clear();
+                                    Self::flush(&rx, &mut leftover);
+                                    clap_count = 0;
+                                    continue;
+                                }
+                                // Require actual speech energy. Push-to-talk used
+                                // to force-process on release even with silence,
+                                // which sent Whisper hallucinations to the agent
+                                // and surfaced ugly 401s instead of a canned reply.
+                                let heard = spoke;
                                 let audio =
                                     capture::resample_linear(&cmd_buf, src_rate, 16_000);
                                 cmd_buf.clear();
@@ -392,11 +519,12 @@ impl VoiceEngine {
 
     /// Transcribe → dispatch to the agent API → respond, then return to IDLE.
     fn process_command(&self, app: &AppHandle, audio: Vec<f32>, heard: bool) {
-        let is_test = self.test_mode.load(Ordering::SeqCst);
         self.set(app, VoiceState::Processing, None);
 
-        if !heard {
-            return self.fail(app, "Didn't catch that.");
+        // No speech detected (or empty capture) — speak a short canned line
+        // instead of sending silence to Whisper / the agent (which can 401).
+        if !heard || audio.is_empty() {
+            return self.fail(app, NO_SPEECH_REPLY);
         }
         let peak = audio.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
         if peak < MIC_SILENCE_FLOOR {
@@ -407,10 +535,22 @@ impl VoiceEngine {
             return self.fail(app, "Speech model still loading…");
         };
         let transcript = match transcriber.transcribe(&audio) {
-            Ok(t) if !t.is_empty() => t,
-            Ok(_) => return self.fail(app, "Didn't catch that."),
+            Ok(t) => t,
+            Err(e) if e.to_lowercase().contains("no audio") => {
+                return self.fail(app, NO_SPEECH_REPLY);
+            }
             Err(e) => return self.fail(app, &e),
         };
+        if is_silence_hallucination(&transcript) {
+            return self.fail(app, NO_SPEECH_REPLY);
+        }
+        self.handle_transcript(app, transcript);
+    }
+
+    /// Shared post-transcription path used by spoken turns and typed `submit_text`.
+    fn handle_transcript(&self, app: &AppHandle, transcript: String) {
+        let is_test = self.test_mode.load(Ordering::SeqCst);
+        self.set(app, VoiceState::Processing, None);
         let _ = app.emit(
             "voice-transcript",
             StateChanged {
@@ -421,34 +561,32 @@ impl VoiceEngine {
 
         if is_test {
             // Echo test: skip the agent entirely and speak back what was heard.
-            self.set(app, VoiceState::Responding, Some(format!("You said: {transcript}")));
+            self.set(
+                app,
+                VoiceState::Responding,
+                Some(format!("You said: {transcript}")),
+            );
             thread::sleep(Duration::from_millis(1800));
             return self.set(app, VoiceState::Idle, None);
         }
 
-        self.set(app, VoiceState::Dispatching, Some(transcript.clone()));
-        let backend = dispatcher::backend_for(&self.agent_settings());
-        
-        // Use a channel to bridge async dispatch from the sync thread
-        let (tx, rx) = std::sync::mpsc::channel();
-        let transcript_for_async = transcript.clone();
-        tauri::async_runtime::spawn(async move {
-            let result = backend.dispatch(transcript_for_async).await;
-            let _ = tx.send(result);
-        });
-        
-        // Block on the channel (not the async runtime)
-        match rx.recv() {
-            Ok(Ok(response)) => {
+        self.set(app, VoiceState::Dispatching, None);
+        let settings = self.agent_settings();
+        if let Err(msg) = crate::openclaw::ensure_gateway(&settings, |status| {
+            self.set(app, VoiceState::Dispatching, Some(status.to_string()));
+        }) {
+            return self.fail(app, &msg);
+        }
+        let backend = dispatcher::backend_for(&settings);
+        match tauri::async_runtime::block_on(backend.dispatch(transcript)) {
+            Ok(response) => {
                 self.set(app, VoiceState::Responding, Some(response));
                 thread::sleep(Duration::from_millis(1800));
             }
-            Ok(Err(e)) => {
-                self.set(app, VoiceState::Error, Some(e.to_string()));
-                thread::sleep(Duration::from_millis(1600));
-            }
-            Err(_) => {
-                self.set(app, VoiceState::Error, Some("Agent dispatch channel closed".to_string()));
+            Err(e) => {
+                // Use the inner message (already user-facing) — not Display's
+                // "dispatch error: …" prefix, which gets spoken aloud via TTS.
+                self.set(app, VoiceState::Error, Some(e.0));
                 thread::sleep(Duration::from_millis(1600));
             }
         }

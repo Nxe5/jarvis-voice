@@ -16,7 +16,7 @@ interface VoiceStore {
   lastError: string;
   /** Completed interactions, newest first. */
   history: HistoryEntry[];
-  /** Whether responses are spoken aloud (browser TTS). */
+  /** Whether responses are spoken aloud (Piper neural TTS, with browser fallback). */
   speakEnabled: boolean;
   /** Whether test mode is armed — turns echo back instead of hitting the agent. */
   testMode: boolean;
@@ -50,7 +50,9 @@ export const useVoiceStore = create<VoiceStore>((set) => ({
           next.lastError = "";
           break;
         case "DISPATCHING":
-          if (detail) next.transcript = detail;
+          // Optional status from the engine (e.g. "OpenClaw isn't active — starting…").
+          // Transcript is already set via voice-transcript during PROCESSING.
+          if (detail) next.response = detail;
           break;
         case "RESPONDING":
           if (detail) next.response = detail;
@@ -65,7 +67,10 @@ export const useVoiceStore = create<VoiceStore>((set) => ({
           ].slice(0, 20);
           break;
         case "ERROR":
-          if (detail) next.lastError = detail;
+          if (detail) {
+            next.lastError = detail;
+            next.response = detail;
+          }
           next.history = [
             {
               transcript: prev.transcript,

@@ -30,22 +30,32 @@ pub trait CommandBackend: Send + Sync {
 }
 
 /// Build the backend from the current agent settings (Settings panel, backed
-/// by `crate::agent_settings`). The `OpenClaw` preset always uses the
-/// hardcoded OpenClaw defaults for URL/model, ignoring whatever's saved in
-/// those fields; `Custom` uses them as saved. Set the URL to `echo` for an
-/// offline loopback test — the same shortcut the old `JARVIS_AGENT_URL=echo`
-/// env var gave.
+/// by `crate::agent_settings`). The `OpenClaw` preset uses the localhost
+/// OpenClaw defaults; `OpenClawWsl` resolves the live WSL IP. Both ignore
+/// whatever's saved in those fields; `Custom` uses them as saved. Set the
+/// URL to `echo` for an offline loopback test — the same shortcut the old
+/// `JARVIS_AGENT_URL=echo` env var gave.
 pub fn backend_for(settings: &crate::agent_settings::AgentSettings) -> Box<dyn CommandBackend> {
-    use crate::agent_settings::{AgentPreset, DEFAULT_AGENT_MODEL, DEFAULT_AGENT_URL};
+    use crate::agent_settings::{
+        openclaw_wsl_url, resolve_openclaw_gateway_token, AgentPreset, DEFAULT_AGENT_MODEL,
+        DEFAULT_AGENT_URL,
+    };
 
     let (url, model) = match settings.preset {
         AgentPreset::OpenClaw => (DEFAULT_AGENT_URL.to_string(), DEFAULT_AGENT_MODEL.to_string()),
+        AgentPreset::OpenClawWsl => (openclaw_wsl_url(), DEFAULT_AGENT_MODEL.to_string()),
         AgentPreset::Custom => (settings.url.clone(), settings.model.clone()),
     };
     if url.trim() == "echo" {
         return Box::new(EchoBackend);
     }
-    Box::new(http::HttpBackend::new(url, settings.key.clone(), model))
+    let key = settings
+        .key
+        .as_ref()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .or_else(|| resolve_openclaw_gateway_token(settings.preset));
+    Box::new(http::HttpBackend::new(url, key, model))
 }
 
 /// Fallback stub backend: echoes the transcript back so the full state machine
@@ -57,7 +67,7 @@ pub struct EchoBackend;
 impl CommandBackend for EchoBackend {
     async fn dispatch(&self, text: String) -> Result<String, DispatchError> {
         if text.trim().is_empty() {
-            return Err(DispatchError("empty transcript".into()));
+            return Err(DispatchError("Didn't catch that.".into()));
         }
         Ok(format!("You said: \"{}\"", text.trim()))
     }

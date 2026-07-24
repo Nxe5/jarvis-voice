@@ -29,7 +29,7 @@ export interface HistoryEntry {
 
 /** Agent gateway settings, editable from the Settings panel. */
 export interface AgentSettings {
-  preset: "openclaw" | "custom";
+  preset: "openclaw" | "openclaw_wsl" | "custom";
   url: string;
   key: string | null;
   model: string;
